@@ -7,4 +7,4 @@ requests==2.32.3
 pydantic==2.10.0
 python-multipart==0.0.18
 websocket-client==1.8.0
-colab-cli @ git+https://github.com/googlecolab/google-colab-cli.git
+google-colab-cli @ git+https://github.com/googlecolab/google-colab-cli.git
