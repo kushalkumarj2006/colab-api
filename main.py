@@ -8,12 +8,12 @@ from typing import Optional, List
 from urllib.parse import quote
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # Official colab_cli library
 from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
@@ -26,7 +26,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import AuthorizedSession, Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-# Allow stateless OAuth (disable PKCE state verification)
+# Allow stateless OAuth (disable internal PKCE; we manage it client-side)
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 # ---- Setup logging ----
@@ -57,21 +57,32 @@ if not CLIENT_CONFIG["installed"]["client_id"] or not CLIENT_CONFIG["installed"]
     logger.error("OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set in environment.")
     raise RuntimeError("Missing OAuth credentials")
 
-def get_auth_url() -> str:
-    """Generate the OAuth authorization URL (stateless, remote copy‑paste)."""
-    flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, PUBLIC_SCOPES)
-    flow.redirect_uri = REMOTE_REDIRECT_URI
-    auth_url, _ = flow.authorization_url(prompt="consent", token_usage="remote")
+def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> str:
+    """Generate the authorization URL with client-provided PKCE challenge."""
+    flow = InstalledAppFlow.from_client_config(
+        CLIENT_CONFIG,
+        PUBLIC_SCOPES,
+        redirect_uri=REMOTE_REDIRECT_URI,
+        enable_pkce=False,  # we supply the challenge manually
+    )
+    auth_url, _ = flow.authorization_url(
+        prompt="consent",
+        token_usage="remote",
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+    )
     logger.info("Auth URL generated (length: %d)", len(auth_url))
     return auth_url
 
-def exchange_code(code: str) -> Credentials:
-    """Exchange code for credentials – stateless, no global _flow."""
-    flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, PUBLIC_SCOPES)
-    flow.redirect_uri = REMOTE_REDIRECT_URI
-    # The remote copy‑paste flow uses PKCE; we ignore state check because
-    # the flow is created fresh and the code contains the verifier.
-    flow.fetch_token(code=code)
+def exchange_code(code: str, code_verifier: str) -> Credentials:
+    """Exchange code for credentials using client-provided PKCE verifier."""
+    flow = InstalledAppFlow.from_client_config(
+        CLIENT_CONFIG,
+        PUBLIC_SCOPES,
+        redirect_uri=REMOTE_REDIRECT_URI,
+        enable_pkce=False,
+    )
+    flow.fetch_token(code=code, code_verifier=code_verifier)
     creds = flow.credentials
     logger.info("Token exchange successful.")
     return creds
@@ -79,7 +90,7 @@ def exchange_code(code: str) -> Credentials:
 # --------------------------------------------------------------------
 # 2. FastAPI app with CORS and logging middleware
 # --------------------------------------------------------------------
-app = FastAPI(title="Colab API (fixed, production)")
+app = FastAPI(title="Colab API (production, client PKCE)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,7 +106,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         logger.info("Request: %s %s", request.method, request.url.path)
         if request.query_params:
             logger.info("Query params: %s", dict(request.query_params))
-        # Avoid reading multipart bodies (upload files) – consumes memory/time
         if request.method in ("POST", "PUT"):
             content_type = request.headers.get("content-type", "")
             if "multipart/form-data" not in content_type:
@@ -118,7 +128,7 @@ app.add_middleware(LoggingMiddleware)
 class CredentialsModel(BaseModel):
     token: str
     refresh_token: str
-    expiry: Optional[str] = None   # ISO string from Google, e.g. "2026-07-28T12:00:00Z"
+    expiry: Optional[str] = None
     scopes: List[str]
     token_uri: str
     client_id: str
@@ -141,26 +151,20 @@ class AutomationRequest(SessionContext):
 
 class InstallRequest(SessionContext):
     packages: Optional[List[str]] = None
-    requirement: Optional[str] = None   # path inside the VM, NOT on the server
+    requirement: Optional[str] = None
     timeout: Optional[float] = 600
-
-class CodeRequest(BaseModel):
-    code: str
 
 # --------------------------------------------------------------------
 # 4. Helpers
 # --------------------------------------------------------------------
 def creds_from_model(model: CredentialsModel) -> Credentials:
-    """Convert CredentialsModel to a google.oauth2.credentials.Credentials."""
+    """Convert CredentialsModel to google.oauth2.credentials.Credentials."""
     data = model.model_dump()
-    # expiry comes as ISO string; google‑auth expects datetime or None
     if data.get("expiry"):
         try:
-            # Remove 'Z' and replace with '+00:00' for fromisoformat
             ts = data["expiry"].replace("Z", "+00:00")
             data["expiry"] = datetime.fromisoformat(ts)
         except ValueError:
-            # If parsing fails, leave as string (might still work)
             pass
     return Credentials.from_authorized_user_info(data)
 
@@ -247,17 +251,21 @@ def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = Fals
 # 5. Endpoints
 # --------------------------------------------------------------------
 @app.get("/auth/url")
-def auth_url():
+def auth_url(code_challenge: str, code_challenge_method: str = "S256"):
     try:
-        return {"auth_url": get_auth_url()}
+        return {"auth_url": get_auth_url(code_challenge, code_challenge_method)}
     except Exception as e:
         logger.exception("Auth URL generation failed")
         raise HTTPException(500, str(e))
 
 @app.post("/auth/token")
-def auth_token(request: CodeRequest):
+def auth_token(request: dict = Body(...)):
+    code = request.get("code")
+    code_verifier = request.get("code_verifier")
+    if not code or not code_verifier:
+        raise HTTPException(400, "Missing code or code_verifier")
     try:
-        creds = exchange_code(request.code)
+        creds = exchange_code(code, code_verifier)
         return {"credentials": json.loads(creds.to_json())}
     except Exception as e:
         logger.exception("Token exchange failed")
@@ -385,7 +393,6 @@ async def upload_file(
     dummy.token = token
     contents = ContentsClient(dummy)
 
-    # Read file bytes asynchronously
     file_bytes = await file.read()
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(file_bytes)
@@ -487,8 +494,6 @@ def run_install(endpoint: str, req: InstallRequest):
     logger.info("Install on %s", endpoint)
     commands = []
     if req.requirement:
-        # req.requirement is the remote path inside the VM – we DO NOT check it on the server.
-        # The client must have already uploaded the file or it must exist on the VM.
         commands.extend(["-r", req.requirement])
     if req.packages:
         commands.extend(req.packages)
