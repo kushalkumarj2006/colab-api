@@ -160,14 +160,33 @@ class ColabRuntime:
         self.session_id = session_id or str(uuid.uuid4())
         self._client: Optional[jupyter_kernel_client.ColabKernelClient] = None
 
+    def create_kernel(self) -> str:
+        """Explicitly creates a Jupyter kernel on the Colab VM via REST API."""
+        if self.kernel_id:
+            return self.kernel_id
+            
+        headers = {
+            "Authorization": f"token {self.token}",
+            "X-Colab-Runtime-Proxy-Token": self.token,
+        }
+        res = requests.post(f"{self.url}/api/kernels", headers=headers, json={"name": "python3"})
+        res.raise_for_status()
+        self.kernel_id = res.json()["id"]
+        return self.kernel_id
+
     def _connect(self) -> jupyter_kernel_client.ColabKernelClient:
         if self._client:
             return self._client
 
+        # Fallback just in case a client didn't pass it, but normally 
+        # create_kernel() is called during /sessions
+        if not self.kernel_id:
+            self.create_kernel()
+
         kwargs = {
             "server_url": self.url,
             "proxy_token": self.token,
-            "kernel_id": self.kernel_id,  # <--- FIX: Always pass kernel_id (even if None)
+            "kernel_id": self.kernel_id,
             "session": self.session_id,
             "headers": {
                 "X-Colab-Client-Agent": "colab-api",
@@ -177,10 +196,6 @@ class ColabRuntime:
 
         client = jupyter_kernel_client.ColabKernelClient(**kwargs)
         client.start()
-
-        # Capture the newly created kernel_id if we didn't have one
-        if not self.kernel_id:
-            self.kernel_id = getattr(client, "kernel_id", None)
 
         self._client = client
         return client
@@ -289,7 +304,24 @@ def create_session(req: CreateSessionRequest, gpu: Optional[str] = None, tpu: Op
     token = proxy_info.get("token") or res.get("runtime_proxy_token")
     url = proxy_info.get("url") or res.get("url")
 
-    response = {"endpoint": endpoint, "token": token, "url": url, "variant": variant, "accelerator": accelerator}
+    # Pre-initialize the kernel so we can return the ID to the client
+    runtime = ColabRuntime(url=url, token=token)
+    try:
+        kernel_id = runtime.create_kernel()
+        session_id = runtime.session_id
+    except Exception as e:
+        logger.error(f"Failed to create initial kernel: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initialize kernel: {str(e)}")
+
+    response = {
+        "endpoint": endpoint, 
+        "token": token, 
+        "url": url, 
+        "variant": variant, 
+        "accelerator": accelerator,
+        "kernel_id": kernel_id,      # Return kernel_id to client
+        "session_id": session_id     # Return session_id to client
+    }
     if updated:
         response["updated_credentials"] = updated
     return response
@@ -299,7 +331,12 @@ def execute(endpoint: str, req: ExecuteRequest):
     creds_data = req.credentials.model_dump()
     _, updated = refresh_if_needed(creds_data)
 
-    runtime = ColabRuntime(url=req.url, token=req.token, kernel_id=req.kernel_id, session_id=req.session_id)
+    runtime = ColabRuntime(
+        url=req.url, 
+        token=req.token, 
+        kernel_id=req.kernel_id, 
+        session_id=req.session_id
+    )
     
     outputs = []
     try:
@@ -311,7 +348,7 @@ def execute(endpoint: str, req: ExecuteRequest):
     finally:
         runtime.disconnect()
 
-    response = {"outputs": outputs, "kernel_id": runtime.kernel_id, "session_id": runtime.session_id}
+    response = {"outputs": outputs}
     if updated:
         response["updated_credentials"] = updated
     return response
