@@ -1,7 +1,5 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
-google-auth==2.35.0
-google-auth-oauthlib==1.2.0
 jupyter-kernel-client>=0.6.0
 requests==2.32.3
 pydantic==2.10.0
