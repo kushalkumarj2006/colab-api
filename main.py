@@ -1,20 +1,14 @@
 import os
 import json
 import uuid
-import base64
-import tempfile
 import logging
-import time
 from typing import Optional, List
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin
 from datetime import datetime, timedelta, timezone
 
 import requests
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from google.oauth2.credentials import Credentials
@@ -25,7 +19,7 @@ import jupyter_kernel_client
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---- OAuth config ----
+# ---- OAuth Config ----
 REMOTE_REDIRECT_URI = "https://sdk.cloud.google.com/applicationdefaultauthcode.html"
 PUBLIC_SCOPES = [
     "openid",
@@ -35,6 +29,7 @@ PUBLIC_SCOPES = [
     "https://www.googleapis.com/auth/colaboratory",
     "https://www.googleapis.com/auth/drive.file",
 ]
+
 CLIENT_CONFIG = {
     "installed": {
         "client_id": os.environ.get("OAUTH_CLIENT_ID"),
@@ -46,16 +41,18 @@ CLIENT_CONFIG = {
         "redirect_uris": [REMOTE_REDIRECT_URI],
     }
 }
-if not CLIENT_CONFIG["installed"]["client_id"] or not CLIENT_CONFIG["installed"]["client_secret"]:
-    raise RuntimeError("Missing OAuth credentials")
 
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
-# ---- OAuth functions ----
+# ---- OAuth Helpers ----
 def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> str:
     flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, PUBLIC_SCOPES, redirect_uri=REMOTE_REDIRECT_URI)
-    auth_url, _ = flow.authorization_url(prompt="consent", token_usage="remote",
-                                         code_challenge=code_challenge, code_challenge_method=code_challenge_method)
+    auth_url, _ = flow.authorization_url(
+        prompt="consent",
+        token_usage="remote",
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method
+    )
     return auth_url
 
 def exchange_code(code: str, code_verifier: str) -> Credentials:
@@ -63,18 +60,11 @@ def exchange_code(code: str, code_verifier: str) -> Credentials:
     flow.fetch_token(code=code, code_verifier=code_verifier)
     return flow.credentials
 
-# ---- Credentials helpers ----
-def creds_from_dict(data: dict) -> Credentials:
-    return Credentials.from_authorized_user_info(data)
-
 def refresh_if_needed(creds_data: dict) -> tuple[Credentials, Optional[dict]]:
-    creds = creds_from_dict(creds_data)
+    creds = Credentials.from_authorized_user_info(creds_data)
     updated = None
     if creds.expiry and isinstance(creds.expiry, datetime):
-        if creds.expiry.tzinfo is None:
-            expiry = creds.expiry.replace(tzinfo=timezone.utc)
-        else:
-            expiry = creds.expiry.astimezone(timezone.utc)
+        expiry = creds.expiry.replace(tzinfo=timezone.utc) if creds.expiry.tzinfo is None else creds.expiry.astimezone(timezone.utc)
         if expiry - datetime.now(timezone.utc) < timedelta(minutes=5):
             try:
                 creds.refresh(Request())
@@ -87,39 +77,12 @@ def refresh_if_needed(creds_data: dict) -> tuple[Credentials, Optional[dict]]:
                     "client_id": creds.client_id,
                     "client_secret": creds.client_secret,
                 }
-                logger.info("Token refreshed.")
+                logger.info("Credentials successfully refreshed.")
             except Exception as e:
-                logger.warning(f"Refresh failed: {e}")
+                logger.warning(f"Failed to refresh credentials: {e}")
     return creds, updated
 
-# ---- FastAPI app ----
-app = FastAPI(title="Colab API (clean)")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-# ---- Models ----
-class CredentialsModel(BaseModel):
-    token: str
-    refresh_token: str
-    expiry: Optional[str] = None
-    scopes: List[str]
-    token_uri: str
-    client_id: str
-    client_secret: str
-
-class SessionContext(BaseModel):
-    credentials: CredentialsModel
-    endpoint: str
-    token: str
-    url: str
-    kernel_id: Optional[str] = None
-    session_id: Optional[str] = None
-
-class ExecuteRequest(SessionContext):
-    code: str
-    timeout: Optional[float] = 30
-    allow_stdin: bool = False
-
-# ---- Colab tunnel client (standalone) ----
+# ---- Colab Tunnel Client ----
 XSSI_PREFIX = ")]}'\n"
 TUN_ENDPOINT = "/tun/m"
 
@@ -141,86 +104,169 @@ class ColabClient:
         req_headers = {"Accept": "application/json", "X-Colab-Client-Agent": "colab-api"}
         if headers:
             req_headers.update(headers)
+        
         resp = self.session.request(method, url, headers=req_headers, params=params, json=json_body)
         if not resp.ok:
-            raise RuntimeError(f"Colab API error {resp.status_code}: {resp.text}")
+            raise RuntimeError(f"Colab API Error ({resp.status_code}): {resp.text}")
+        
         body = strip_xssi(resp.text)
         return json.loads(body) if body else {}
 
-    def assign(self, variant: str = None, accelerator: str = None) -> dict:
-        params = {"nbh": uuid_to_web_safe_base64(uuid.uuid4())}
-        if variant:
-            params["variant"] = variant
-        if accelerator:
-            params["accelerator"] = accelerator
+    def assign(self, variant: str = "DEFAULT", accelerator: str = "NONE") -> dict:
+        params = {
+            "nbh": uuid_to_web_safe_base64(uuid.uuid4()),
+            "nsa": "1",
+            "variant": variant,
+            "accelerator": accelerator,
+        }
         get_resp = self._request(f"{TUN_ENDPOINT}/assign", params=params)
         if "endpoint" in get_resp:
             return get_resp
+        
         token = get_resp.get("token")
         if not token:
-            raise RuntimeError("No XSRF token")
-        return self._request(f"{TUN_ENDPOINT}/assign", method="POST", params=params, headers={"X-Goog-Colab-Token": token})
+            raise RuntimeError("Failed to retrieve XSRF token for session assignment.")
+        
+        return self._request(
+            f"{TUN_ENDPOINT}/assign",
+            method="POST",
+            params=params,
+            headers={"X-Goog-Colab-Token": token}
+        )
 
     def unassign(self, endpoint: str):
         resp = self._request(f"{TUN_ENDPOINT}/unassign/{endpoint}")
         token = resp.get("token")
         if token:
-            self._request(f"{TUN_ENDPOINT}/unassign/{endpoint}", method="POST", headers={"X-Goog-Colab-Token": token})
+            self._request(
+                f"{TUN_ENDPOINT}/unassign/{endpoint}",
+                method="POST",
+                headers={"X-Goog-Colab-Token": token}
+            )
 
     def keep_alive(self, endpoint: str):
         url = f"{TUN_ENDPOINT}/{endpoint}/keep-alive/"
         try:
-            self._request(url, headers={"X-Colab-Tunnel": "Google"}, method="GET")
+            self._request(url, method="GET", headers={"X-Colab-Tunnel": "Google"})
         except requests.exceptions.ReadTimeout:
-            pass  # normal
+            pass  # ReadTimeout is expected during long pings
 
-# ---- Jupyter runtime (standalone) ----
+# ---- Enhanced Jupyter Runtime Client ----
 class ColabRuntime:
-    def __init__(self, url: str, token: str, kernel_id: str = None, session_id: str = None):
+    """Jupyter kernel client for Colab runtime proxy with dynamic unpacking and session state."""
+
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        kernel_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
         self.url = url
         self.token = token
         self.kernel_id = kernel_id
-        self.session_id = session_id
+        self.session_id = session_id or str(uuid.uuid4())
+        self._client: Optional[jupyter_kernel_client.KernelClient] = None
+
+    def _connect(self) -> jupyter_kernel_client.KernelClient:
+        if self._client:
+            return self._client
+
+        kwargs = {
+            "server_url": self.url,
+            "token": self.token,
+            "session": self.session_id,
+            "headers": {
+                "X-Colab-Client-Agent": "colab-api",
+                "X-Colab-Runtime-Proxy-Token": self.token,
+            },
+        }
+        if self.kernel_id:
+            kwargs["kernel_id"] = self.kernel_id
+
+        client = jupyter_kernel_client.KernelClient(**kwargs)
+        client.start()
+
+        if not self.kernel_id:
+            self.kernel_id = getattr(client, "kernel_id", None)
+
+        self._client = client
+        return client
+
+    def execute(self, code: str, timeout: Optional[float] = None) -> list:
+        client = self._connect()
+        outputs = []
+
+        def _hook(msg: dict) -> None:
+            mtype = msg.get("msg_type", "")
+            content = msg.get("content", {})
+
+            if mtype == "stream":
+                outputs.append({
+                    "type": "stream",
+                    "name": content.get("name", "stdout"),
+                    "text": content.get("text", ""),
+                })
+            elif mtype == "execute_result":
+                outputs.append({
+                    "type": "execute_result",
+                    "data": content.get("data", {}),
+                })
+            elif mtype == "display_data":
+                outputs.append({
+                    "type": "display_data",
+                    "data": content.get("data", {}),
+                })
+            elif mtype == "error":
+                outputs.append({
+                    "type": "error",
+                    "ename": content.get("ename", ""),
+                    "evalue": content.get("evalue", ""),
+                    "traceback": content.get("traceback", []),
+                })
+
+        client.execute_interactive(
+            code,
+            timeout=timeout,  # None = wait indefinitely
+            output_hook=_hook,
+            allow_stdin=False,
+        )
+        return outputs
+
+    def disconnect(self):
+        if not self._client:
+            return
+        try:
+            self._client.stop()
+        except Exception:
+            try:
+                self._client.stop_channels()
+            except Exception:
+                pass
         self._client = None
 
-    @property
-    def client(self):
-        if not self._client:
-            client_kwargs = {
-                "subprotocol": jupyter_kernel_client.JupyterSubprotocol.DEFAULT,
-                "extra_params": {"colab-runtime-proxy-token": self.token},
-            }
-            if self.session_id:
-                client_kwargs["session"] = self.session_id
-            self._client = jupyter_kernel_client.KernelClient(
-                server_url=self.url,
-                token=self.token,
-                kernel_id=self.kernel_id,
-                client_kwargs=client_kwargs,
-                headers={"X-Colab-Client-Agent": "colab-api", "X-Colab-Runtime-Proxy-Token": self.token},
-            )
-            self._client._own_kernel = False
-            self._client.start()
-        return self._client
+# ---- FastAPI App ----
+app = FastAPI(title="Colab Standalone API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-    def execute(self, code: str, output_hook=None, timeout: float = 30, allow_stdin: bool = False) -> list:
-        kwargs = {"allow_stdin": allow_stdin, "timeout": timeout}
-        if output_hook:
-            outputs = []
-            def hook(msg):
-                from jupyter_kernel_client.client import output_hook as default_hook
-                new_idx = default_hook(outputs, msg)
-                for i in new_idx:
-                    if i < len(outputs):
-                        output_hook(outputs[i])
-            self.client.execute_interactive(code, output_hook=hook, **kwargs)
-            return outputs
-        else:
-            return self.client.execute(code, **kwargs).get("outputs", [])
+# ---- Models ----
+class CredentialsModel(BaseModel):
+    token: str
+    refresh_token: str
+    expiry: Optional[str] = None
+    scopes: List[str]
+    token_uri: str
+    client_id: str
+    client_secret: str
 
-    def stop(self):
-        if self._client:
-            self._client._manager.client.stop_channels()
+class ExecuteRequest(BaseModel):
+    credentials: CredentialsModel
+    url: str
+    token: str
+    kernel_id: Optional[str] = None
+    session_id: Optional[str] = None
+    code: str
+    timeout: Optional[float] = None  # None = wait forever
 
 # ---- Endpoints ----
 @app.get("/auth/url")
@@ -244,18 +290,22 @@ def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu
 
     variant = "DEFAULT"
     accelerator = "NONE"
+
     if tpu:
         variant = "TPU"
         accelerator = "V5E1" if tpu.lower() == "v5e1" else "V6E1"
     elif gpu:
         variant = "GPU"
         mapping = {"a100": "A100", "h100": "H100", "l4": "L4", "t4": "T4", "g4": "G4"}
-        accelerator = mapping.get(gpu.lower(), "A100")
+        accelerator = mapping.get(gpu.lower(), "T4")
 
     res = client.assign(variant=variant, accelerator=accelerator)
     endpoint = res["endpoint"]
-    token = res.get("runtimeProxyInfo", {}).get("token") or res.get("runtime_proxy_token")
-    url = res.get("runtimeProxyInfo", {}).get("url") or res.get("url")
+    
+    proxy_info = res.get("runtimeProxyInfo", {})
+    token = proxy_info.get("token") or res.get("runtime_proxy_token")
+    url = proxy_info.get("url") or res.get("url")
+
     response = {
         "endpoint": endpoint,
         "token": token,
@@ -270,29 +320,63 @@ def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu
 @app.post("/sessions/{endpoint}/execute")
 def execute(endpoint: str, req: ExecuteRequest):
     creds_data = req.credentials.model_dump()
-    creds, updated = refresh_if_needed(creds_data)
-    if updated:
-        req.credentials = CredentialsModel(**updated)  # update for runtime
-    runtime = ColabRuntime(req.url, req.token, kernel_id=req.kernel_id, session_id=req.session_id)
+    _, updated = refresh_if_needed(creds_data)
+
+    runtime = ColabRuntime(
+        url=req.url,
+        token=req.token,
+        kernel_id=req.kernel_id,
+        session_id=req.session_id,
+    )
+    
     outputs = []
-    def hook(out): outputs.append(out)
     try:
-        runtime.execute(req.code, output_hook=hook, timeout=req.timeout, allow_stdin=req.allow_stdin)
+        outputs = runtime.execute(req.code, timeout=req.timeout)
+    except Exception as e:
+        logger.error(f"Execution failed: {e}")
+        # If jupyter_client raised an error, the traceback was likely already 
+        # captured by the output_hook. We append a fallback error just in case.
+        if not any(o.get("type") == "error" for o in outputs):
+            outputs.append({
+                "type": "error",
+                "ename": "ExecutionException",
+                "evalue": str(e),
+                "traceback": []
+            })
     finally:
-        runtime.stop()
-    response = {"outputs": outputs}
+        runtime.disconnect()
+
+    # We always return 200 OK so the client receives the kernel_id and outputs
+    response = {
+        "outputs": outputs,
+        "kernel_id": runtime.kernel_id,
+        "session_id": runtime.session_id,
+    }
+    if updated:
+        response["updated_credentials"] = updated
+    return response
+
+@app.post("/sessions/{endpoint}/keep-alive")
+def keep_alive(endpoint: str, credentials: CredentialsModel):
+    creds_data = credentials.model_dump()
+    creds, updated = refresh_if_needed(creds_data)
+    sess = AuthorizedSession(creds)
+    client = ColabClient(sess)
+    client.keep_alive(endpoint)
+    
+    response = {"status": "ok"}
     if updated:
         response["updated_credentials"] = updated
     return response
 
 @app.delete("/sessions/{endpoint}")
-def delete_session(endpoint: str, credentials: CredentialsModel, token: str, url: str):
+def delete_session(endpoint: str, credentials: CredentialsModel):
     creds_data = credentials.model_dump()
     creds, _ = refresh_if_needed(creds_data)
     sess = AuthorizedSession(creds)
     client = ColabClient(sess)
     client.unassign(endpoint)
-    return {"message": "Deleted"}
+    return {"message": f"Session {endpoint} terminated successfully."}
 
 @app.get("/health")
 def health():
