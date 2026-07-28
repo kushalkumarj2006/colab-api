@@ -1,5 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
-google-colab-cli @ git+https://github.com/googlecolab/google-colab-cli.git
-jupyter-kernel-client @ git+https://github.com/googlecolab/jupyter-kernel-client.git
+google-auth
+google-auth-oauthlib
+jupyter-kernel-client
+requests
