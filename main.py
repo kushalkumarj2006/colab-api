@@ -1,23 +1,24 @@
 import os
 import json
-import logging
 import uuid
 import tempfile
+import logging
+import time
 from typing import Optional, List
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Body
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
-# colab_cli library imports
-from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse, Assignment
+# Import from the official colab_cli library
+from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
 from colab_cli.utils import get_status_code
-from colab_cli.auth import PUBLIC_SCOPES, AuthProvider, get_credentials
+from colab_cli.auth import PUBLIC_SCOPES
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import AuthorizedSession, Request
@@ -84,7 +85,7 @@ def exchange_code(code: str) -> Credentials:
 # --------------------------------------------------------------------
 # 2. FastAPI app with CORS and logging middleware
 # --------------------------------------------------------------------
-app = FastAPI(title="Colab API")
+app = FastAPI(title="Colab API (library-based)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,17 +95,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Logging middleware
-from starlette.middleware.base import BaseHTTPMiddleware
-import time
-
+# ---- Logging middleware ----
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         start = time.time()
         logger.info("Request: %s %s", request.method, request.url.path)
         if request.query_params:
             logger.info("Query params: %s", dict(request.query_params))
-        # Attempt to log request body for POST/PUT (but don't consume it)
         if request.method in ("POST", "PUT"):
             try:
                 body = await request.body()
@@ -233,7 +230,6 @@ def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = Fals
     hook = None
     if drive_hook_enabled:
         hook = make_drive_hook(creds, req.endpoint)
-    # Use the library's ColabRuntime (which handles JupyterSubprotocol correctly)
     runtime = ColabRuntime(
         req.url,
         req.token,
@@ -258,7 +254,6 @@ def auth_url():
 
 @app.post("/auth/token")
 def auth_token(request: CodeRequest):
-    """Exchange code for credentials (expects JSON body with 'code' field)."""
     code = request.code
     logger.info("Handling /auth/token request")
     try:
@@ -270,7 +265,6 @@ def auth_token(request: CodeRequest):
 
 @app.post("/sessions")
 def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu: Optional[str] = None):
-    """Create a new Colab session (VM)."""
     logger.info("Creating session with gpu=%s, tpu=%s", gpu, tpu)
     creds_obj = Credentials.from_authorized_user_info(credentials.dict())
     sess = AuthorizedSession(creds_obj)
@@ -361,7 +355,6 @@ def execute(endpoint: str, req: ExecuteRequest):
 @app.get("/sessions/{endpoint}/files")
 def list_files(endpoint: str, credentials: CredentialsModel, token: str, url: str, path: str = "content"):
     logger.info("List files for endpoint %s, path=%s", endpoint, path)
-    # Create a dummy session state object that ContentsClient expects
     class Dummy:
         pass
     dummy = Dummy()
