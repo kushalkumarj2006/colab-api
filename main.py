@@ -580,8 +580,10 @@ def auth_url_endpoint():
         logger.error("Failed to generate auth URL: %s", str(e), exc_info=True)
         raise HTTPException(500, str(e))
 
+from fastapi import Body
+
 @app.post("/auth/token")
-def auth_token_endpoint(code: str):
+def auth_token_endpoint(code: str = Body(...)):
     logger.info("Handling /auth/token request")
     try:
         creds = exchange_code(code)
