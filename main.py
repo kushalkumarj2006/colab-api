@@ -615,21 +615,16 @@ def create_session_endpoint(request: CreateSessionRequest):
         sess = AuthorizedSession(creds)
         colab = ColabClient(sess)
         variant, accel = resolve_accelerator(gpu, tpu)
-        logger.info("Resolved variant=%s, accelerator=%s", variant, accel)
         res = colab.assign(uuid.uuid4(), variant=variant, accelerator=accel)
-        logger.info("Assignment response: %s", res)
         if "endpoint" in res:
             endpoint = res["endpoint"]
-            token = res.get("runtime_proxy_info", {}).get("token")
-            url = res.get("runtime_proxy_info", {}).get("url")
-            if not token:
-                token = res.get("runtime_proxy_token")
+            proxy_info = res.get("runtimeProxyInfo", {})
+            token = proxy_info.get("token")
+            url = proxy_info.get("url")
         else:
             endpoint = res.get("endpoint")
             token = res.get("runtime_proxy_token") or res.get("token")
             url = res.get("url")
-        logger.info("Session created: endpoint=%s, token length=%d, url=%s",
-                    endpoint, len(token) if token else 0, url)
         return {
             "endpoint": endpoint,
             "token": token,
@@ -638,7 +633,6 @@ def create_session_endpoint(request: CreateSessionRequest):
             "accelerator": accel,
         }
     except Exception as e:
-        logger.error("Session creation failed: %s", str(e), exc_info=True)
         raise HTTPException(400, str(e))
 
 @app.post("/sessions/{endpoint}/keep-alive")
