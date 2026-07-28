@@ -166,9 +166,10 @@ class ColabRuntime:
         self.token = token
         self.kernel_id = kernel_id
         self.session_id = session_id or str(uuid.uuid4())
-        self._client: Optional[jupyter_kernel_client.KernelClient] = None
+        # FIX: Use ColabKernelClient instead of KernelClient
+        self._client: Optional[jupyter_kernel_client.ColabKernelClient] = None
 
-    def _connect(self) -> jupyter_kernel_client.KernelClient:
+    def _connect(self) -> jupyter_kernel_client.ColabKernelClient:
         if self._client:
             return self._client
 
@@ -184,7 +185,8 @@ class ColabRuntime:
         if self.kernel_id:
             kwargs["kernel_id"] = self.kernel_id
 
-        client = jupyter_kernel_client.KernelClient(**kwargs)
+        # FIX: Use ColabKernelClient instead of KernelClient
+        client = jupyter_kernel_client.ColabKernelClient(**kwargs)
         client.start()
 
         if not self.kernel_id:
@@ -334,8 +336,6 @@ def execute(endpoint: str, req: ExecuteRequest):
         outputs = runtime.execute(req.code, timeout=req.timeout)
     except Exception as e:
         logger.error(f"Execution failed: {e}")
-        # If jupyter_client raised an error, the traceback was likely already 
-        # captured by the output_hook. We append a fallback error just in case.
         if not any(o.get("type") == "error" for o in outputs):
             outputs.append({
                 "type": "error",
@@ -346,7 +346,6 @@ def execute(endpoint: str, req: ExecuteRequest):
     finally:
         runtime.disconnect()
 
-    # We always return 200 OK so the client receives the kernel_id and outputs
     response = {
         "outputs": outputs,
         "kernel_id": runtime.kernel_id,
