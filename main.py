@@ -596,13 +596,18 @@ def auth_token_endpoint(request: CodeRequest):
         logger.error("Token exchange failed: %s", str(e), exc_info=True)
         raise HTTPException(400, str(e))
 
+class CreateSessionRequest(BaseModel):
+    credentials: CredentialsModel
+    name: Optional[str] = None
+    gpu: Optional[str] = None
+    tpu: Optional[str] = None
+
 @app.post("/sessions")
-def create_session_endpoint(
-    credentials: CredentialsModel,
-    name: Optional[str] = None,
-    gpu: Optional[str] = None,
-    tpu: Optional[str] = None,
-):
+def create_session_endpoint(request: CreateSessionRequest):
+    credentials = request.credentials
+    name = request.name
+    gpu = request.gpu
+    tpu = request.tpu
     logger.info("Creating session with credentials (token length: %d), gpu=%s, tpu=%s",
                 len(credentials.token), gpu, tpu)
     try:
