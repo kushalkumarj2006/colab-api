@@ -4,8 +4,9 @@ import uuid
 import tempfile
 import logging
 import time
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from urllib.parse import quote
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
 from fastapi.responses import FileResponse
@@ -14,7 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-# Patch jupyter_kernel_client before importing anything that uses it
+# Patch jupyter_kernel_client
 import jupyter_kernel_client
 if not hasattr(jupyter_kernel_client, 'KernelClient'):
     try:
@@ -27,7 +28,6 @@ if not hasattr(jupyter_kernel_client, 'KernelClient'):
         except ImportError:
             pass
 
-# Now import colab_cli
 from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
@@ -149,13 +149,66 @@ class InstallRequest(SessionContext):
     requirement: Optional[str] = None
     timeout: Optional[float] = 600
 
-# ---- Helpers ----
+# ---- Helpers with token refresh ----
 def creds_from_model(model: CredentialsModel) -> Credentials:
     return Credentials.from_authorized_user_info(model.model_dump())
 
-def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
+def refresh_credentials_if_needed(
+    creds_model: CredentialsModel,
+    force_refresh: bool = False
+) -> Tuple[Credentials, Optional[CredentialsModel]]:
+    """
+    Check if the access token is expired or will expire in the next 5 minutes.
+    If so, refresh it using the refresh_token.
+    Returns (credentials, updated_model_or_None).
+    """
     creds = creds_from_model(creds_model)
-    return AuthorizedSession(creds)
+    updated_model = None
+    need_refresh = force_refresh
+
+    if not need_refresh and creds.expiry:
+        # Check if expiry is within 5 minutes from now
+        if isinstance(creds.expiry, datetime):
+            # If expiry is timezone-naive, assume UTC
+            if creds.expiry.tzinfo is None:
+                expiry_utc = creds.expiry.replace(tzinfo=timezone.utc)
+            else:
+                expiry_utc = creds.expiry.astimezone(timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            if expiry_utc - now_utc < timedelta(minutes=5):
+                need_refresh = True
+
+    if need_refresh:
+        try:
+            logger.info("Refreshing access token...")
+            creds.refresh(Request())
+            # Build updated model
+            updated_model = CredentialsModel(
+                token=creds.token,
+                refresh_token=creds.refresh_token,
+                expiry=creds.expiry.isoformat() if creds.expiry else None,
+                scopes=creds.scopes if creds.scopes else [],
+                token_uri=creds.token_uri,
+                client_id=creds.client_id,
+                client_secret=creds.client_secret,
+            )
+            logger.info("Token refreshed successfully.")
+        except Exception as e:
+            logger.warning(f"Token refresh failed: {e}")
+            # Continue with old credentials; they might still work.
+
+    return creds, updated_model
+
+def get_authorized_session_and_updated(
+    creds_model: CredentialsModel,
+    force_refresh: bool = False
+) -> Tuple[AuthorizedSession, Optional[CredentialsModel]]:
+    creds, updated = refresh_credentials_if_needed(creds_model, force_refresh)
+    return AuthorizedSession(creds), updated
+
+def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
+    session, _ = get_authorized_session_and_updated(creds_model)
+    return session
 
 def make_drive_hook(credentials: Credentials, endpoint: str):
     session = AuthorizedSession(credentials)
@@ -258,7 +311,7 @@ def auth_token(request: dict = Body(...)):
 @app.post("/sessions")
 def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu: Optional[str] = None):
     logger.info("Creating session with gpu=%s, tpu=%s", gpu, tpu)
-    sess = get_authorized_session(credentials)
+    sess, updated_creds = get_authorized_session_and_updated(credentials)
     client = Client(Prod(), sess)
 
     from colab_cli.client import Variant, Accelerator
@@ -302,35 +355,49 @@ def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu
         variant_val = variant.value
         accel_val = accelerator.value
 
-    logger.info("Session created: endpoint=%s", endpoint)
-    return {
+    response = {
         "endpoint": endpoint,
         "token": token,
         "url": url,
         "variant": variant_val,
         "accelerator": accel_val,
     }
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.post("/sessions/{endpoint}/keep-alive")
 def keep_alive(endpoint: str, req: SessionContext):
     logger.info("Keep-alive for %s", endpoint)
-    sess = get_authorized_session(req.credentials)
+    sess, updated_creds = get_authorized_session_and_updated(req.credentials)
     client = Client(Prod(), sess)
     try:
         client.keep_alive_assignment(endpoint)
     except Exception as e:
         logger.exception("Keep-alive failed")
         raise HTTPException(500, str(e))
-    return {"status": "ok"}
+    response = {"status": "ok"}
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.post("/sessions/{endpoint}/execute")
 def execute(endpoint: str, req: ExecuteRequest):
     logger.info("Execute request for %s", endpoint)
-    try:
-        _, runtime = get_session_and_runtime(req)
-    except Exception as e:
-        logger.exception("Failed to build runtime")
-        raise HTTPException(500, str(e))
+    sess, updated_creds = get_authorized_session_and_updated(req.credentials)
+
+    # Update the request's credentials with the possibly refreshed ones
+    if updated_creds:
+        req.credentials = updated_creds
+
+    # Build runtime using the refreshed credentials
+    creds = creds_from_model(req.credentials)
+    runtime = ColabRuntime(
+        req.url,
+        req.token,
+        kernel_id=req.kernel_id,
+        session_id=req.session_id,
+    )
 
     outputs = []
     def hook(out):
@@ -344,12 +411,15 @@ def execute(endpoint: str, req: ExecuteRequest):
     finally:
         runtime.stop()
 
-    logger.info("Execution completed with %d outputs", len(outputs))
-    return {"outputs": outputs}
+    response = {"outputs": outputs}
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
-# ---- File endpoints (unchanged) ----
+# ---- File endpoints (with refresh) ----
 @app.post("/sessions/{endpoint}/files/list")
 def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content"):
+    sess, updated_creds = get_authorized_session_and_updated(req.credentials)
     class Dummy:
         pass
     dummy = Dummy()
@@ -361,7 +431,10 @@ def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content
     except Exception as e:
         logger.exception("List files failed")
         raise HTTPException(500, str(e))
-    return {"files": data.get("content", [])}
+    response = {"files": data.get("content", [])}
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.post("/sessions/{endpoint}/files/upload")
 async def upload_file(
@@ -372,7 +445,7 @@ async def upload_file(
     remote_path: str = Form(...),
     file: UploadFile = File(...),
 ):
-    logger.info("Upload to %s -> %s", endpoint, remote_path)
+    sess, updated_creds = get_authorized_session_and_updated(credentials)
     class Dummy:
         pass
     dummy = Dummy()
@@ -392,11 +465,14 @@ async def upload_file(
         raise HTTPException(500, str(e))
     finally:
         os.unlink(local_path)
-    return {"message": "Uploaded"}
+    response = {"message": "Uploaded"}
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.get("/sessions/{endpoint}/files/download/{path:path}")
 def download_file(endpoint: str, path: str, token: str, url: str):
-    logger.info("Download from %s: %s", endpoint, path)
+    # Download doesn't need credentials refresh (uses token/url only)
     class Dummy:
         pass
     dummy = Dummy()
@@ -423,7 +499,7 @@ def download_file(endpoint: str, path: str, token: str, url: str):
 
 @app.delete("/sessions/{endpoint}/files/{path:path}")
 def delete_file(endpoint: str, path: str, token: str, url: str):
-    logger.info("Delete from %s: %s", endpoint, path)
+    # Delete also doesn't use credentials directly
     class Dummy:
         pass
     dummy = Dummy()
@@ -440,13 +516,26 @@ def delete_file(endpoint: str, path: str, token: str, url: str):
 # ---- Automation endpoints ----
 @app.post("/sessions/{endpoint}/automation/auth")
 def run_auth(endpoint: str, req: AutomationRequest):
+    sess, updated_creds = get_authorized_session_and_updated(req.credentials)
+    # Update req.credentials for runtime
+    if updated_creds:
+        req.credentials = updated_creds
+    creds = creds_from_model(req.credentials)
+
+    runtime = ColabRuntime(
+        req.url,
+        req.token,
+        kernel_id=req.kernel_id,
+        session_id=req.session_id,
+    )
+    runtime.colab_request_hook = make_drive_hook(creds, req.endpoint)
+
     code = (
         "import os\n"
         "os.environ['USE_AUTH_EPHEM'] = '0'\n"
         "from google.colab import auth\n"
         "auth.authenticate_user()\n"
     )
-    _, runtime = get_session_and_runtime(req, drive_hook_enabled=True)
     outputs = []
     def hook(out):
         outputs.append(out)
@@ -457,12 +546,28 @@ def run_auth(endpoint: str, req: AutomationRequest):
         raise HTTPException(500, str(e))
     finally:
         runtime.stop()
-    return {"outputs": outputs}
+
+    response = {"outputs": outputs}
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.post("/sessions/{endpoint}/automation/drivemount")
 def run_drivemount(endpoint: str, req: AutomationRequest, mount_path: str = "/content/drive"):
+    sess, updated_creds = get_authorized_session_and_updated(req.credentials)
+    if updated_creds:
+        req.credentials = updated_creds
+    creds = creds_from_model(req.credentials)
+
+    runtime = ColabRuntime(
+        req.url,
+        req.token,
+        kernel_id=req.kernel_id,
+        session_id=req.session_id,
+    )
+    runtime.colab_request_hook = make_drive_hook(creds, req.endpoint)
+
     code = f"from google.colab import drive\ndrive.mount('{mount_path}')"
-    _, runtime = get_session_and_runtime(req, drive_hook_enabled=True)
     outputs = []
     def hook(out):
         outputs.append(out)
@@ -473,11 +578,19 @@ def run_drivemount(endpoint: str, req: AutomationRequest, mount_path: str = "/co
         raise HTTPException(500, str(e))
     finally:
         runtime.stop()
-    return {"outputs": outputs}
+
+    response = {"outputs": outputs}
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.post("/sessions/{endpoint}/automation/install")
 def run_install(endpoint: str, req: InstallRequest):
-    logger.info("Install on %s", endpoint)
+    sess, updated_creds = get_authorized_session_and_updated(req.credentials)
+    if updated_creds:
+        req.credentials = updated_creds
+    _, runtime = get_session_and_runtime(req)
+
     commands = []
     if req.requirement:
         commands.extend(["-r", req.requirement])
@@ -499,7 +612,6 @@ def install():
         print('Installation Complete (via pip)!')
 install()
 """
-    _, runtime = get_session_and_runtime(req)
     outputs = []
     def hook(out):
         outputs.append(out)
@@ -510,11 +622,16 @@ install()
         raise HTTPException(500, str(e))
     finally:
         runtime.stop()
-    return {"outputs": outputs}
+
+    response = {"outputs": outputs}
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.post("/sessions/{endpoint}/url")
 def connect_url(endpoint: str, credentials: CredentialsModel, token: str, url: str,
                 host: str = "https://colab.research.google.com"):
+    # No token refresh needed; just return URL
     host_clean = host.rstrip("/")
     backend_path = f"/tun/m/{endpoint}"
     dbu = quote(backend_path, safe="")
@@ -530,9 +647,7 @@ def version():
 @app.post("/whoami")
 def whoami(credentials: CredentialsModel):
     logger.info("Whoami called")
-    creds = creds_from_model(credentials)
-    if not creds.valid:
-        creds.refresh(Request())
+    creds, updated_creds = refresh_credentials_if_needed(credentials, force_refresh=True)
     token = creds.token
     import urllib.request
     url = f"https://oauth2.googleapis.com/tokeninfo?access_token={token}"
@@ -541,11 +656,14 @@ def whoami(credentials: CredentialsModel):
             info = json.loads(resp.read().decode())
     except Exception as e:
         raise HTTPException(400, str(e))
-    return {
+    response = {
         "email": info.get("email"),
         "scopes": info.get("scope", "").split(),
         "expires_in": info.get("expires_in"),
     }
+    if updated_creds:
+        response["updated_credentials"] = updated_creds.model_dump()
+    return response
 
 @app.get("/health")
 def health():
