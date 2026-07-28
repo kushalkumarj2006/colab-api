@@ -1,8 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
-jupyter-kernel-client>=0.6.0
 requests==2.32.3
-pydantic==2.10.0
 python-multipart==0.0.18
 websocket-client==1.8.0
 google-colab-cli @ git+https://github.com/googlecolab/google-colab-cli.git
