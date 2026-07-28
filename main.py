@@ -153,20 +153,11 @@ class ColabClient:
 
 # ---- Enhanced Jupyter Runtime Client ----
 class ColabRuntime:
-    """Jupyter kernel client for Colab runtime proxy with dynamic unpacking and session state."""
-
-    def __init__(
-        self,
-        url: str,
-        token: str,
-        kernel_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ):
+    def __init__(self, url: str, token: str, kernel_id: Optional[str] = None, session_id: Optional[str] = None):
         self.url = url
         self.token = token
         self.kernel_id = kernel_id
         self.session_id = session_id or str(uuid.uuid4())
-        # FIX: Use ColabKernelClient instead of KernelClient
         self._client: Optional[jupyter_kernel_client.ColabKernelClient] = None
 
     def _connect(self) -> jupyter_kernel_client.ColabKernelClient:
@@ -185,7 +176,6 @@ class ColabRuntime:
         if self.kernel_id:
             kwargs["kernel_id"] = self.kernel_id
 
-        # FIX: Use ColabKernelClient instead of KernelClient
         client = jupyter_kernel_client.ColabKernelClient(**kwargs)
         client.start()
 
@@ -204,35 +194,15 @@ class ColabRuntime:
             content = msg.get("content", {})
 
             if mtype == "stream":
-                outputs.append({
-                    "type": "stream",
-                    "name": content.get("name", "stdout"),
-                    "text": content.get("text", ""),
-                })
+                outputs.append({"type": "stream", "name": content.get("name", "stdout"), "text": content.get("text", "")})
             elif mtype == "execute_result":
-                outputs.append({
-                    "type": "execute_result",
-                    "data": content.get("data", {}),
-                })
+                outputs.append({"type": "execute_result", "data": content.get("data", {})})
             elif mtype == "display_data":
-                outputs.append({
-                    "type": "display_data",
-                    "data": content.get("data", {}),
-                })
+                outputs.append({"type": "display_data", "data": content.get("data", {})})
             elif mtype == "error":
-                outputs.append({
-                    "type": "error",
-                    "ename": content.get("ename", ""),
-                    "evalue": content.get("evalue", ""),
-                    "traceback": content.get("traceback", []),
-                })
+                outputs.append({"type": "error", "ename": content.get("ename", ""), "evalue": content.get("evalue", ""), "traceback": content.get("traceback", [])})
 
-        client.execute_interactive(
-            code,
-            timeout=timeout,  # None = wait indefinitely
-            output_hook=_hook,
-            allow_stdin=False,
-        )
+        client.execute_interactive(code, timeout=timeout, output_hook=_hook, allow_stdin=False)
         return outputs
 
     def disconnect(self):
@@ -251,7 +221,7 @@ class ColabRuntime:
 app = FastAPI(title="Colab Standalone API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ---- Models ----
+# ---- Pydantic Models ----
 class CredentialsModel(BaseModel):
     token: str
     refresh_token: str
@@ -261,6 +231,9 @@ class CredentialsModel(BaseModel):
     client_id: str
     client_secret: str
 
+class CreateSessionRequest(BaseModel):
+    credentials: CredentialsModel
+
 class ExecuteRequest(BaseModel):
     credentials: CredentialsModel
     url: str
@@ -268,7 +241,15 @@ class ExecuteRequest(BaseModel):
     kernel_id: Optional[str] = None
     session_id: Optional[str] = None
     code: str
-    timeout: Optional[float] = None  # None = wait forever
+    timeout: Optional[float] = None
+
+class DeleteSessionRequest(BaseModel):
+    credentials: CredentialsModel
+    token: str
+    url: str
+
+class KeepAliveRequest(BaseModel):
+    credentials: CredentialsModel
 
 # ---- Endpoints ----
 @app.get("/auth/url")
@@ -284,8 +265,8 @@ def auth_token(data: dict = Body(...)):
     return {"credentials": json.loads(creds.to_json())}
 
 @app.post("/sessions")
-def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu: Optional[str] = None):
-    creds_data = credentials.model_dump()
+def create_session(req: CreateSessionRequest, gpu: Optional[str] = None, tpu: Optional[str] = None):
+    creds_data = req.credentials.model_dump()
     creds, updated = refresh_if_needed(creds_data)
     sess = AuthorizedSession(creds)
     client = ColabClient(sess)
@@ -308,13 +289,7 @@ def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu
     token = proxy_info.get("token") or res.get("runtime_proxy_token")
     url = proxy_info.get("url") or res.get("url")
 
-    response = {
-        "endpoint": endpoint,
-        "token": token,
-        "url": url,
-        "variant": variant,
-        "accelerator": accelerator,
-    }
+    response = {"endpoint": endpoint, "token": token, "url": url, "variant": variant, "accelerator": accelerator}
     if updated:
         response["updated_credentials"] = updated
     return response
@@ -324,12 +299,7 @@ def execute(endpoint: str, req: ExecuteRequest):
     creds_data = req.credentials.model_dump()
     _, updated = refresh_if_needed(creds_data)
 
-    runtime = ColabRuntime(
-        url=req.url,
-        token=req.token,
-        kernel_id=req.kernel_id,
-        session_id=req.session_id,
-    )
+    runtime = ColabRuntime(url=req.url, token=req.token, kernel_id=req.kernel_id, session_id=req.session_id)
     
     outputs = []
     try:
@@ -337,27 +307,18 @@ def execute(endpoint: str, req: ExecuteRequest):
     except Exception as e:
         logger.error(f"Execution failed: {e}")
         if not any(o.get("type") == "error" for o in outputs):
-            outputs.append({
-                "type": "error",
-                "ename": "ExecutionException",
-                "evalue": str(e),
-                "traceback": []
-            })
+            outputs.append({"type": "error", "ename": "ExecutionException", "evalue": str(e), "traceback": []})
     finally:
         runtime.disconnect()
 
-    response = {
-        "outputs": outputs,
-        "kernel_id": runtime.kernel_id,
-        "session_id": runtime.session_id,
-    }
+    response = {"outputs": outputs, "kernel_id": runtime.kernel_id, "session_id": runtime.session_id}
     if updated:
         response["updated_credentials"] = updated
     return response
 
 @app.post("/sessions/{endpoint}/keep-alive")
-def keep_alive(endpoint: str, credentials: CredentialsModel):
-    creds_data = credentials.model_dump()
+def keep_alive(endpoint: str, req: KeepAliveRequest):
+    creds_data = req.credentials.model_dump()
     creds, updated = refresh_if_needed(creds_data)
     sess = AuthorizedSession(creds)
     client = ColabClient(sess)
@@ -369,8 +330,8 @@ def keep_alive(endpoint: str, credentials: CredentialsModel):
     return response
 
 @app.delete("/sessions/{endpoint}")
-def delete_session(endpoint: str, credentials: CredentialsModel):
-    creds_data = credentials.model_dump()
+def delete_session(endpoint: str, req: DeleteSessionRequest):
+    creds_data = req.credentials.model_dump()
     creds, _ = refresh_if_needed(creds_data)
     sess = AuthorizedSession(creds)
     client = ColabClient(sess)
