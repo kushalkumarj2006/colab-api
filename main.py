@@ -581,9 +581,12 @@ def auth_url_endpoint():
         raise HTTPException(500, str(e))
 
 from fastapi import Body
+class CodeRequest(BaseModel):
+    code: str
 
 @app.post("/auth/token")
-def auth_token_endpoint(code: str = Body(...)):
+def auth_token_endpoint(request: CodeRequest):
+    code = request.code
     logger.info("Handling /auth/token request")
     try:
         creds = exchange_code(code)
