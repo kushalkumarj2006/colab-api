@@ -15,6 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
+# colab_cli imports
 from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
@@ -63,7 +64,6 @@ def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> st
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
     )
-    logger.info("Auth URL generated (length: %d)", len(auth_url))
     return auth_url
 
 def exchange_code(code: str, code_verifier: str) -> Credentials:
@@ -73,9 +73,7 @@ def exchange_code(code: str, code_verifier: str) -> Credentials:
         redirect_uri=REMOTE_REDIRECT_URI,
     )
     flow.fetch_token(code=code, code_verifier=code_verifier)
-    creds = flow.credentials
-    logger.info("Token exchange successful.")
-    return creds
+    return flow.credentials
 
 app = FastAPI(title="Colab API")
 
@@ -109,6 +107,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(LoggingMiddleware)
 
+# ---- Models ----
 class CredentialsModel(BaseModel):
     token: str
     refresh_token: str
@@ -138,8 +137,10 @@ class InstallRequest(SessionContext):
     requirement: Optional[str] = None
     timeout: Optional[float] = 600
 
+# ---- Helpers ----
 def creds_from_model(model: CredentialsModel) -> Credentials:
     """Convert CredentialsModel to google.oauth2.credentials.Credentials."""
+    # expiry is already a string (ISO format) – do NOT convert to datetime
     return Credentials.from_authorized_user_info(model.model_dump())
 
 def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
@@ -221,6 +222,7 @@ def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = Fals
     )
     return colab, runtime
 
+# ---- Endpoints ----
 @app.get("/auth/url")
 def auth_url(code_challenge: str, code_challenge_method: str = "S256"):
     try:
@@ -313,7 +315,12 @@ def keep_alive(endpoint: str, req: SessionContext):
 @app.post("/sessions/{endpoint}/execute")
 def execute(endpoint: str, req: ExecuteRequest):
     logger.info("Execute request for %s", endpoint)
-    _, runtime = get_session_and_runtime(req)
+    try:
+        _, runtime = get_session_and_runtime(req)
+    except Exception as e:
+        logger.exception("Failed to build session and runtime")
+        raise HTTPException(500, str(e))
+
     outputs = []
     def hook(out):
         outputs.append(out)
@@ -329,6 +336,7 @@ def execute(endpoint: str, req: ExecuteRequest):
     logger.info("Execution done, %d outputs", len(outputs))
     return {"outputs": outputs}
 
+# ---- File endpoints (unchanged) ----
 @app.post("/sessions/{endpoint}/files/list")
 def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content"):
     class Dummy:
@@ -418,6 +426,7 @@ def delete_file(endpoint: str, path: str, token: str, url: str):
         raise HTTPException(500, str(e))
     return {"message": "Deleted"}
 
+# ---- Automation endpoints (unchanged) ----
 @app.post("/sessions/{endpoint}/automation/auth")
 def run_auth(endpoint: str, req: AutomationRequest):
     code = (
