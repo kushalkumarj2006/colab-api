@@ -63,7 +63,6 @@ def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> st
         CLIENT_CONFIG,
         PUBLIC_SCOPES,
         redirect_uri=REMOTE_REDIRECT_URI,
-        enable_pkce=False,  # we supply the challenge manually
     )
     auth_url, _ = flow.authorization_url(
         prompt="consent",
@@ -80,7 +79,6 @@ def exchange_code(code: str, code_verifier: str) -> Credentials:
         CLIENT_CONFIG,
         PUBLIC_SCOPES,
         redirect_uri=REMOTE_REDIRECT_URI,
-        enable_pkce=False,
     )
     flow.fetch_token(code=code, code_verifier=code_verifier)
     creds = flow.credentials
@@ -358,7 +356,6 @@ def execute(endpoint: str, req: ExecuteRequest):
     logger.info("Execution done, %d outputs", len(outputs))
     return {"outputs": outputs}
 
-# File operations: changed GET (with query params) to POST to avoid exposing credentials in URLs
 @app.post("/sessions/{endpoint}/files/list")
 def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content"):
     """List files (POST to keep credentials out of URLs)."""
