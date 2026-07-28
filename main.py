@@ -17,6 +17,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import AuthorizedSession, Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 import jupyter_kernel_client
+from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------------------------
 # 1. Constants & Helpers
@@ -393,6 +394,13 @@ class InstallRequest(SessionContext):
 # --------------------------------------------------------------------
 
 app = FastAPI(title="Colab API (standalone)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, restrict to your frontend domain(s)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    )
 
 def get_session_and_runtime(req: SessionContext, drive_hook_enabled=False):
     creds = Credentials.from_authorized_user_info(req.credentials.dict())
