@@ -149,7 +149,7 @@ class ColabClient:
         try:
             self._request(url, method="GET", headers={"X-Colab-Tunnel": "Google"})
         except requests.exceptions.ReadTimeout:
-            pass  # ReadTimeout is expected during long pings
+            pass
 
 # ---- Enhanced Jupyter Runtime Client ----
 class ColabRuntime:
@@ -166,7 +166,7 @@ class ColabRuntime:
 
         kwargs = {
             "server_url": self.url,
-            "token": self.token,
+            "proxy_token": self.token,  # <--- FIX: Added proxy_token argument
             "session": self.session_id,
             "headers": {
                 "X-Colab-Client-Agent": "colab-api",
