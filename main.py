@@ -15,7 +15,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-# Official colab_cli library
 from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
@@ -26,19 +25,14 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import AuthorizedSession, Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-# Allow stateless OAuth (disable internal PKCE; we manage it client-side)
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
-# ---- Setup logging ----
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------
-# 1. OAuth configuration (from environment)
-# --------------------------------------------------------------------
 REMOTE_REDIRECT_URI = "https://sdk.cloud.google.com/applicationdefaultauthcode.html"
 
 CLIENT_CONFIG = {
@@ -58,7 +52,6 @@ if not CLIENT_CONFIG["installed"]["client_id"] or not CLIENT_CONFIG["installed"]
     raise RuntimeError("Missing OAuth credentials")
 
 def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> str:
-    """Generate the authorization URL with client-provided PKCE challenge."""
     flow = InstalledAppFlow.from_client_config(
         CLIENT_CONFIG,
         PUBLIC_SCOPES,
@@ -74,7 +67,6 @@ def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> st
     return auth_url
 
 def exchange_code(code: str, code_verifier: str) -> Credentials:
-    """Exchange code for credentials using client-provided PKCE verifier."""
     flow = InstalledAppFlow.from_client_config(
         CLIENT_CONFIG,
         PUBLIC_SCOPES,
@@ -85,10 +77,7 @@ def exchange_code(code: str, code_verifier: str) -> Credentials:
     logger.info("Token exchange successful.")
     return creds
 
-# --------------------------------------------------------------------
-# 2. FastAPI app with CORS and logging middleware
-# --------------------------------------------------------------------
-app = FastAPI(title="Colab API (production, client PKCE)")
+app = FastAPI(title="Colab API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,9 +109,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(LoggingMiddleware)
 
-# --------------------------------------------------------------------
-# 3. Models
-# --------------------------------------------------------------------
 class CredentialsModel(BaseModel):
     token: str
     refresh_token: str
@@ -152,19 +138,9 @@ class InstallRequest(SessionContext):
     requirement: Optional[str] = None
     timeout: Optional[float] = 600
 
-# --------------------------------------------------------------------
-# 4. Helpers
-# --------------------------------------------------------------------
 def creds_from_model(model: CredentialsModel) -> Credentials:
     """Convert CredentialsModel to google.oauth2.credentials.Credentials."""
-    data = model.model_dump()
-    if data.get("expiry"):
-        try:
-            ts = data["expiry"].replace("Z", "+00:00")
-            data["expiry"] = datetime.fromisoformat(ts)
-        except ValueError:
-            pass
-    return Credentials.from_authorized_user_info(data)
+    return Credentials.from_authorized_user_info(model.model_dump())
 
 def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
     creds = creds_from_model(creds_model)
@@ -245,9 +221,6 @@ def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = Fals
     )
     return colab, runtime
 
-# --------------------------------------------------------------------
-# 5. Endpoints
-# --------------------------------------------------------------------
 @app.get("/auth/url")
 def auth_url(code_challenge: str, code_challenge_method: str = "S256"):
     try:
@@ -358,7 +331,6 @@ def execute(endpoint: str, req: ExecuteRequest):
 
 @app.post("/sessions/{endpoint}/files/list")
 def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content"):
-    """List files (POST to keep credentials out of URLs)."""
     class Dummy:
         pass
     dummy = Dummy()
@@ -381,7 +353,6 @@ async def upload_file(
     remote_path: str = Form(...),
     file: UploadFile = File(...),
 ):
-    """Upload a file (async read to ensure full content)."""
     logger.info("Upload to %s -> %s", endpoint, remote_path)
     class Dummy:
         pass
@@ -406,7 +377,6 @@ async def upload_file(
 
 @app.get("/sessions/{endpoint}/files/download/{path:path}")
 def download_file(endpoint: str, path: str, token: str, url: str):
-    """Download a file (uses query params but only token/url; no client_secret)."""
     logger.info("Download from %s: %s", endpoint, path)
     class Dummy:
         pass
@@ -448,7 +418,6 @@ def delete_file(endpoint: str, path: str, token: str, url: str):
         raise HTTPException(500, str(e))
     return {"message": "Deleted"}
 
-# Automation endpoints (use nested credentials as before)
 @app.post("/sessions/{endpoint}/automation/auth")
 def run_auth(endpoint: str, req: AutomationRequest):
     code = (
@@ -562,9 +531,6 @@ def whoami(credentials: CredentialsModel):
 def health():
     return {"status": "ok"}
 
-# --------------------------------------------------------------------
-# 6. Run
-# --------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
