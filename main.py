@@ -14,6 +14,20 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
+# Patch jupyter_kernel_client before importing anything that uses it
+import jupyter_kernel_client
+if not hasattr(jupyter_kernel_client, 'KernelClient'):
+    try:
+        from jupyter_kernel_client.client import KernelClient
+        jupyter_kernel_client.KernelClient = KernelClient
+    except ImportError:
+        try:
+            from jupyter_kernel_client.kernelclient import KernelClient
+            jupyter_kernel_client.KernelClient = KernelClient
+        except ImportError:
+            pass
+
+# Now import colab_cli
 from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
@@ -62,7 +76,6 @@ def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> st
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
     )
-    logger.info("Auth URL generated")
     return auth_url
 
 def exchange_code(code: str, code_verifier: str) -> Credentials:
@@ -136,11 +149,8 @@ class InstallRequest(SessionContext):
     requirement: Optional[str] = None
     timeout: Optional[float] = 600
 
-# ---- Helpers (copied from original CLI patterns) ----
+# ---- Helpers ----
 def creds_from_model(model: CredentialsModel) -> Credentials:
-    """Exactly mirror the original CLI's Credentials.from_authorized_user_info usage."""
-    # The original CLI reads from a token JSON file and calls from_authorized_user_info.
-    # Our model already has the same fields as the token JSON.
     return Credentials.from_authorized_user_info(model.model_dump())
 
 def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
@@ -148,7 +158,6 @@ def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
     return AuthorizedSession(creds)
 
 def make_drive_hook(credentials: Credentials, endpoint: str):
-    """Drivefs ephemeral credential propagation hook."""
     session = AuthorizedSession(credentials)
     domain = "https://colab.research.google.com"
 
@@ -174,7 +183,6 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
             logger.error("Propagation GET failed: %d", resp.status_code)
             return False
 
-        # Strip XSSI prefix
         text = resp.text
         if text.startswith(")]}'\n"):
             text = text[4:]
@@ -197,7 +205,6 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
             logger.error("Propagation POST failed: %d", resp.status_code)
             return False
 
-        # Resume kernel
         reply = wsclient.session.msg(
             "input_reply",
             {"value": {"type": "colab_reply", "colab_msg_id": msg_id}},
@@ -210,12 +217,10 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
     return hook
 
 def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = False):
-    """Build a ColabClient and ColabRuntime exactly as the CLI does."""
     creds = creds_from_model(req.credentials)
     sess = AuthorizedSession(creds)
     colab = Client(Prod(), sess)
 
-    # Instantiate runtime without drive_hook (the library doesn't accept it)
     runtime = ColabRuntime(
         req.url,
         req.token,
@@ -223,7 +228,6 @@ def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = Fals
         session_id=req.session_id,
     )
 
-    # Set the hook after construction
     if drive_hook_enabled:
         runtime.colab_request_hook = make_drive_hook(creds, req.endpoint)
 
@@ -322,7 +326,6 @@ def keep_alive(endpoint: str, req: SessionContext):
 @app.post("/sessions/{endpoint}/execute")
 def execute(endpoint: str, req: ExecuteRequest):
     logger.info("Execute request for %s", endpoint)
-
     try:
         _, runtime = get_session_and_runtime(req)
     except Exception as e:
@@ -344,6 +347,7 @@ def execute(endpoint: str, req: ExecuteRequest):
     logger.info("Execution completed with %d outputs", len(outputs))
     return {"outputs": outputs}
 
+# ---- File endpoints (unchanged) ----
 @app.post("/sessions/{endpoint}/files/list")
 def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content"):
     class Dummy:
