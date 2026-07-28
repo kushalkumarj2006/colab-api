@@ -6,14 +6,16 @@ import logging
 import time
 from typing import Optional, List
 from urllib.parse import quote
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel
+from starlette.background import BackgroundTask
+from pydantic import BaseModel, Field
 
-# Import from the official colab_cli library
+# Official colab_cli library
 from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
@@ -23,6 +25,9 @@ from colab_cli.auth import PUBLIC_SCOPES
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import AuthorizedSession, Request
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+# Allow stateless OAuth (disable PKCE state verification)
+os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 # ---- Setup logging ----
 logging.basicConfig(
@@ -52,40 +57,29 @@ if not CLIENT_CONFIG["installed"]["client_id"] or not CLIENT_CONFIG["installed"]
     logger.error("OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set in environment.")
     raise RuntimeError("Missing OAuth credentials")
 
-_flow: Optional[InstalledAppFlow] = None
-
 def get_auth_url() -> str:
-    """Generate the OAuth authorization URL (remote copy-paste flow)."""
-    global _flow
-    logger.info("Creating OAuth flow with redirect_uri='%s'", REMOTE_REDIRECT_URI)
-    _flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, PUBLIC_SCOPES)
-    _flow.redirect_uri = REMOTE_REDIRECT_URI
-    auth_url, _ = _flow.authorization_url(prompt="consent", token_usage="remote")
+    """Generate the OAuth authorization URL (stateless, remote copy‑paste)."""
+    flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, PUBLIC_SCOPES)
+    flow.redirect_uri = REMOTE_REDIRECT_URI
+    auth_url, _ = flow.authorization_url(prompt="consent", token_usage="remote")
     logger.info("Auth URL generated (length: %d)", len(auth_url))
     return auth_url
 
 def exchange_code(code: str) -> Credentials:
-    """Exchange an authorization code for OAuth credentials."""
-    global _flow
-    if _flow is None:
-        logger.error("No OAuth flow initiated. Call get_auth_url() first.")
-        raise RuntimeError("No OAuth flow initiated. Call get_auth_url() first.")
-    try:
-        logger.info("Exchanging authorization code (first 10 chars: %s...)", code[:10])
-        _flow.fetch_token(code=code)
-        creds = _flow.credentials
-        logger.info("Token exchange successful. Access token length: %d", len(creds.token))
-        return creds
-    except Exception as e:
-        logger.exception("Token exchange failed")
-        raise RuntimeError(f"Failed to exchange code: {e}")
-    finally:
-        _flow = None
+    """Exchange code for credentials – stateless, no global _flow."""
+    flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, PUBLIC_SCOPES)
+    flow.redirect_uri = REMOTE_REDIRECT_URI
+    # The remote copy‑paste flow uses PKCE; we ignore state check because
+    # the flow is created fresh and the code contains the verifier.
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    logger.info("Token exchange successful.")
+    return creds
 
 # --------------------------------------------------------------------
 # 2. FastAPI app with CORS and logging middleware
 # --------------------------------------------------------------------
-app = FastAPI(title="Colab API (library-based)")
+app = FastAPI(title="Colab API (fixed, production)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,20 +89,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Logging middleware ----
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         start = time.time()
         logger.info("Request: %s %s", request.method, request.url.path)
         if request.query_params:
             logger.info("Query params: %s", dict(request.query_params))
+        # Avoid reading multipart bodies (upload files) – consumes memory/time
         if request.method in ("POST", "PUT"):
-            try:
-                body = await request.body()
-                if body:
-                    logger.debug("Request body: %s", body[:500].decode(errors='ignore'))
-            except Exception:
-                pass
+            content_type = request.headers.get("content-type", "")
+            if "multipart/form-data" not in content_type:
+                try:
+                    body = await request.body()
+                    if body:
+                        logger.debug("Request body: %s", body[:500].decode(errors='ignore'))
+                except Exception:
+                    pass
         response = await call_next(request)
         duration = time.time() - start
         logger.info("Response: %s (took %.3fs)", response.status_code, duration)
@@ -122,7 +118,7 @@ app.add_middleware(LoggingMiddleware)
 class CredentialsModel(BaseModel):
     token: str
     refresh_token: str
-    expiry: Optional[str] = None
+    expiry: Optional[str] = None   # ISO string from Google, e.g. "2026-07-28T12:00:00Z"
     scopes: List[str]
     token_uri: str
     client_id: str
@@ -145,7 +141,7 @@ class AutomationRequest(SessionContext):
 
 class InstallRequest(SessionContext):
     packages: Optional[List[str]] = None
-    requirement: Optional[str] = None
+    requirement: Optional[str] = None   # path inside the VM, NOT on the server
     timeout: Optional[float] = 600
 
 class CodeRequest(BaseModel):
@@ -154,12 +150,25 @@ class CodeRequest(BaseModel):
 # --------------------------------------------------------------------
 # 4. Helpers
 # --------------------------------------------------------------------
-def get_authorized_session(creds_dict: dict) -> AuthorizedSession:
-    creds = Credentials.from_authorized_user_info(creds_dict)
+def creds_from_model(model: CredentialsModel) -> Credentials:
+    """Convert CredentialsModel to a google.oauth2.credentials.Credentials."""
+    data = model.model_dump()
+    # expiry comes as ISO string; google‑auth expects datetime or None
+    if data.get("expiry"):
+        try:
+            # Remove 'Z' and replace with '+00:00' for fromisoformat
+            ts = data["expiry"].replace("Z", "+00:00")
+            data["expiry"] = datetime.fromisoformat(ts)
+        except ValueError:
+            # If parsing fails, leave as string (might still work)
+            pass
+    return Credentials.from_authorized_user_info(data)
+
+def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
+    creds = creds_from_model(creds_model)
     return AuthorizedSession(creds)
 
 def make_drive_hook(credentials: Credentials, endpoint: str):
-    """Return a hook that handles `dfs_ephemeral` colab_request messages."""
     session = AuthorizedSession(credentials)
     domain = "https://colab.research.google.com"
 
@@ -180,13 +189,11 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
             "record": "false",
         }
 
-        # GET to obtain a propagation token
         resp = session.request("GET", url, params=params)
         if resp.status_code != 200:
             logger.error("Propagation GET failed: %d", resp.status_code)
             return False
 
-        # Strip XSSI prefix
         text = resp.text
         if text.startswith(")]}'\n"):
             text = text[4:]
@@ -196,7 +203,6 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
             logger.error("No token in propagation response")
             return False
 
-        # POST to propagate credentials
         headers = {"x-goog-colab-token": token}
         params["dryrun"] = "false"
         resp = session.request(
@@ -210,7 +216,6 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
             logger.error("Propagation POST failed: %d", resp.status_code)
             return False
 
-        # Send input_reply to resume the kernel
         reply = wsclient.session.msg(
             "input_reply",
             {"value": {"type": "colab_reply", "colab_msg_id": msg_id}},
@@ -223,8 +228,7 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
     return hook
 
 def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = False):
-    """Build a ColabClient and ColabRuntime from the request context."""
-    creds = Credentials.from_authorized_user_info(req.credentials.dict())
+    creds = creds_from_model(req.credentials)
     sess = AuthorizedSession(creds)
     colab = Client(Prod(), sess)
     hook = None
@@ -244,20 +248,16 @@ def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = Fals
 # --------------------------------------------------------------------
 @app.get("/auth/url")
 def auth_url():
-    logger.info("Handling /auth/url request")
     try:
-        url = get_auth_url()
-        return {"auth_url": url}
+        return {"auth_url": get_auth_url()}
     except Exception as e:
-        logger.exception("Failed to generate auth URL")
+        logger.exception("Auth URL generation failed")
         raise HTTPException(500, str(e))
 
 @app.post("/auth/token")
 def auth_token(request: CodeRequest):
-    code = request.code
-    logger.info("Handling /auth/token request")
     try:
-        creds = exchange_code(code)
+        creds = exchange_code(request.code)
         return {"credentials": json.loads(creds.to_json())}
     except Exception as e:
         logger.exception("Token exchange failed")
@@ -266,8 +266,7 @@ def auth_token(request: CodeRequest):
 @app.post("/sessions")
 def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu: Optional[str] = None):
     logger.info("Creating session with gpu=%s, tpu=%s", gpu, tpu)
-    creds_obj = Credentials.from_authorized_user_info(credentials.dict())
-    sess = AuthorizedSession(creds_obj)
+    sess = get_authorized_session(credentials)
     client = Client(Prod(), sess)
 
     from colab_cli.client import Variant, Accelerator
@@ -291,7 +290,7 @@ def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu
         res = client.assign(uuid.uuid4(), variant=variant, accelerator=accelerator)
     except ColabRequestError as e:
         status = get_status_code(e)
-        logger.error("Assignment failed with status %d: %s", status, str(e))
+        logger.error("Assignment failed with status %d", status)
         if status == 412:
             raise HTTPException(429, "Too many active sessions. Stop an existing one first.")
         if status == 400 and accelerator != Accelerator.NONE:
@@ -304,7 +303,7 @@ def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu
         url = res.runtime_proxy_info.url
         variant_val = res.variant.value
         accel_val = res.accelerator.value
-    else:  # Assignment response
+    else:
         endpoint = res.endpoint
         token = getattr(res, "runtime_proxy_token", None) or getattr(res, "token", None)
         url = getattr(res, "runtime_proxy_info", {}).get("url", "")
@@ -322,9 +321,8 @@ def create_session(credentials: CredentialsModel, gpu: Optional[str] = None, tpu
 
 @app.post("/sessions/{endpoint}/keep-alive")
 def keep_alive(endpoint: str, req: SessionContext):
-    logger.info("Keep-alive for endpoint %s", endpoint)
-    creds = Credentials.from_authorized_user_info(req.credentials.dict())
-    sess = AuthorizedSession(creds)
+    logger.info("Keep-alive for %s", endpoint)
+    sess = get_authorized_session(req.credentials)
     client = Client(Prod(), sess)
     try:
         client.keep_alive_assignment(endpoint)
@@ -335,7 +333,7 @@ def keep_alive(endpoint: str, req: SessionContext):
 
 @app.post("/sessions/{endpoint}/execute")
 def execute(endpoint: str, req: ExecuteRequest):
-    logger.info("Execute request for endpoint %s", endpoint)
+    logger.info("Execute request for %s", endpoint)
     _, runtime = get_session_and_runtime(req)
     outputs = []
     def hook(out):
@@ -349,17 +347,18 @@ def execute(endpoint: str, req: ExecuteRequest):
     finally:
         runtime.stop()
 
-    logger.info("Execution completed with %d outputs", len(outputs))
+    logger.info("Execution done, %d outputs", len(outputs))
     return {"outputs": outputs}
 
-@app.get("/sessions/{endpoint}/files")
-def list_files(endpoint: str, credentials: CredentialsModel, token: str, url: str, path: str = "content"):
-    logger.info("List files for endpoint %s, path=%s", endpoint, path)
+# File operations: changed GET (with query params) to POST to avoid exposing credentials in URLs
+@app.post("/sessions/{endpoint}/files/list")
+def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content"):
+    """List files (POST to keep credentials out of URLs)."""
     class Dummy:
         pass
     dummy = Dummy()
-    dummy.url = url
-    dummy.token = token
+    dummy.url = req.url
+    dummy.token = req.token
     contents = ContentsClient(dummy)
     try:
         data = contents.list_dir(path)
@@ -368,25 +367,30 @@ def list_files(endpoint: str, credentials: CredentialsModel, token: str, url: st
         raise HTTPException(500, str(e))
     return {"files": data.get("content", [])}
 
-@app.post("/sessions/{endpoint}/files")
-def upload_file(
+@app.post("/sessions/{endpoint}/files/upload")
+async def upload_file(
     endpoint: str,
     credentials: CredentialsModel,
-    token: str,
-    url: str,
+    token: str = Form(...),
+    url: str = Form(...),
     remote_path: str = Form(...),
     file: UploadFile = File(...),
 ):
-    logger.info("Upload file to endpoint %s, remote_path=%s", endpoint, remote_path)
+    """Upload a file (async read to ensure full content)."""
+    logger.info("Upload to %s -> %s", endpoint, remote_path)
     class Dummy:
         pass
     dummy = Dummy()
     dummy.url = url
     dummy.token = token
     contents = ContentsClient(dummy)
+
+    # Read file bytes asynchronously
+    file_bytes = await file.read()
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(file.file.read())
+        tmp.write(file_bytes)
         local_path = tmp.name
+
     try:
         contents.upload(local_path, remote_path)
     except Exception as e:
@@ -396,29 +400,37 @@ def upload_file(
         os.unlink(local_path)
     return {"message": "Uploaded"}
 
-@app.get("/sessions/{endpoint}/files/{path:path}")
-def download_file(endpoint: str, path: str, credentials: CredentialsModel, token: str, url: str):
-    logger.info("Download file from endpoint %s, path=%s", endpoint, path)
+@app.get("/sessions/{endpoint}/files/download/{path:path}")
+def download_file(endpoint: str, path: str, token: str, url: str):
+    """Download a file (uses query params but only token/url; no client_secret)."""
+    logger.info("Download from %s: %s", endpoint, path)
     class Dummy:
         pass
     dummy = Dummy()
     dummy.url = url
     dummy.token = token
     contents = ContentsClient(dummy)
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        local_path = tmp.name
+
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    local_path = tmp.name
+    tmp.close()
+
     try:
         contents.download(path, local_path)
-        return FileResponse(local_path, filename=os.path.basename(path))
+        return FileResponse(
+            local_path,
+            filename=os.path.basename(path),
+            background=BackgroundTask(os.unlink, local_path)
+        )
     except Exception as e:
+        if os.path.exists(local_path):
+            os.unlink(local_path)
         logger.exception("Download failed")
         raise HTTPException(500, str(e))
-    finally:
-        os.unlink(local_path)
 
 @app.delete("/sessions/{endpoint}/files/{path:path}")
-def delete_file(endpoint: str, path: str, credentials: CredentialsModel, token: str, url: str):
-    logger.info("Delete file from endpoint %s, path=%s", endpoint, path)
+def delete_file(endpoint: str, path: str, token: str, url: str):
+    logger.info("Delete from %s: %s", endpoint, path)
     class Dummy:
         pass
     dummy = Dummy()
@@ -432,10 +444,9 @@ def delete_file(endpoint: str, path: str, credentials: CredentialsModel, token: 
         raise HTTPException(500, str(e))
     return {"message": "Deleted"}
 
-# ----- Automation endpoints -----
+# Automation endpoints (use nested credentials as before)
 @app.post("/sessions/{endpoint}/automation/auth")
 def run_auth(endpoint: str, req: AutomationRequest):
-    logger.info("Automation auth for endpoint %s", endpoint)
     code = (
         "import os\n"
         "os.environ['USE_AUTH_EPHEM'] = '0'\n"
@@ -457,7 +468,6 @@ def run_auth(endpoint: str, req: AutomationRequest):
 
 @app.post("/sessions/{endpoint}/automation/drivemount")
 def run_drivemount(endpoint: str, req: AutomationRequest, mount_path: str = "/content/drive"):
-    logger.info("Automation drivemount for endpoint %s, mount_path=%s", endpoint, mount_path)
     code = f"from google.colab import drive\ndrive.mount('{mount_path}')"
     _, runtime = get_session_and_runtime(req, drive_hook_enabled=True)
     outputs = []
@@ -474,24 +484,16 @@ def run_drivemount(endpoint: str, req: AutomationRequest, mount_path: str = "/co
 
 @app.post("/sessions/{endpoint}/automation/install")
 def run_install(endpoint: str, req: InstallRequest):
-    logger.info("Automation install for endpoint %s", endpoint)
+    logger.info("Install on %s", endpoint)
     commands = []
     if req.requirement:
-        class Dummy:
-            pass
-        dummy = Dummy()
-        dummy.url = req.url
-        dummy.token = req.token
-        contents = ContentsClient(dummy)
-        if not os.path.isfile(req.requirement):
-            raise HTTPException(400, "Requirements file not found locally")
-        remote = f"content/{os.path.basename(req.requirement)}"
-        contents.upload(req.requirement, remote)
-        commands.extend(["-r", f"/{remote}"])
+        # req.requirement is the remote path inside the VM – we DO NOT check it on the server.
+        # The client must have already uploaded the file or it must exist on the VM.
+        commands.extend(["-r", req.requirement])
     if req.packages:
         commands.extend(req.packages)
     if not commands:
-        raise HTTPException(400, "No packages specified")
+        raise HTTPException(400, "No packages or requirements specified")
 
     cmd_str = ", ".join(f"'{c}'" for c in commands)
     code = f"""
@@ -522,7 +524,6 @@ install()
 @app.post("/sessions/{endpoint}/url")
 def connect_url(endpoint: str, credentials: CredentialsModel, token: str, url: str,
                 host: str = "https://colab.research.google.com"):
-    logger.info("Connect URL for endpoint %s", endpoint)
     host_clean = host.rstrip("/")
     backend_path = f"/tun/m/{endpoint}"
     dbu = quote(backend_path, safe="")
@@ -538,12 +539,13 @@ def version():
 @app.post("/whoami")
 def whoami(credentials: CredentialsModel):
     logger.info("Whoami called")
-    creds = Credentials.from_authorized_user_info(credentials.dict())
+    creds = creds_from_model(credentials)
     if not creds.valid:
         creds.refresh(Request())
-    url = f"https://oauth2.googleapis.com/tokeninfo?access_token={creds.token}"
+    token = creds.token
+    import urllib.request
+    url = f"https://oauth2.googleapis.com/tokeninfo?access_token={token}"
     try:
-        import urllib.request
         with urllib.request.urlopen(url) as resp:
             info = json.loads(resp.read().decode())
     except Exception as e:
