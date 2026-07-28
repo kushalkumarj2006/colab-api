@@ -117,6 +117,7 @@ class SessionContext(BaseModel):
 class ExecuteRequest(SessionContext):
     code: str
     timeout: Optional[float] = 30
+    allow_stdin: bool = False
 
 # ---- Colab tunnel client (standalone) ----
 XSSI_PREFIX = ")]}'\n"
