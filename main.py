@@ -6,7 +6,6 @@ import logging
 import time
 from typing import Optional, List
 from urllib.parse import quote
-from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
 from fastapi.responses import FileResponse
@@ -15,7 +14,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-# colab_cli imports
 from colab_cli.client import Client, Prod, ColabRequestError, PostAssignmentResponse
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
@@ -64,6 +62,7 @@ def get_auth_url(code_challenge: str, code_challenge_method: str = "S256") -> st
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
     )
+    logger.info("Auth URL generated")
     return auth_url
 
 def exchange_code(code: str, code_verifier: str) -> Credentials:
@@ -137,10 +136,11 @@ class InstallRequest(SessionContext):
     requirement: Optional[str] = None
     timeout: Optional[float] = 600
 
-# ---- Helpers ----
+# ---- Helpers (copied from original CLI patterns) ----
 def creds_from_model(model: CredentialsModel) -> Credentials:
-    """Convert CredentialsModel to google.oauth2.credentials.Credentials."""
-    # expiry is already a string (ISO format) – do NOT convert to datetime
+    """Exactly mirror the original CLI's Credentials.from_authorized_user_info usage."""
+    # The original CLI reads from a token JSON file and calls from_authorized_user_info.
+    # Our model already has the same fields as the token JSON.
     return Credentials.from_authorized_user_info(model.model_dump())
 
 def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
@@ -148,6 +148,7 @@ def get_authorized_session(creds_model: CredentialsModel) -> AuthorizedSession:
     return AuthorizedSession(creds)
 
 def make_drive_hook(credentials: Credentials, endpoint: str):
+    """Drivefs ephemeral credential propagation hook."""
     session = AuthorizedSession(credentials)
     domain = "https://colab.research.google.com"
 
@@ -173,6 +174,7 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
             logger.error("Propagation GET failed: %d", resp.status_code)
             return False
 
+        # Strip XSSI prefix
         text = resp.text
         if text.startswith(")]}'\n"):
             text = text[4:]
@@ -195,6 +197,7 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
             logger.error("Propagation POST failed: %d", resp.status_code)
             return False
 
+        # Resume kernel
         reply = wsclient.session.msg(
             "input_reply",
             {"value": {"type": "colab_reply", "colab_msg_id": msg_id}},
@@ -207,19 +210,23 @@ def make_drive_hook(credentials: Credentials, endpoint: str):
     return hook
 
 def get_session_and_runtime(req: SessionContext, drive_hook_enabled: bool = False):
+    """Build a ColabClient and ColabRuntime exactly as the CLI does."""
     creds = creds_from_model(req.credentials)
     sess = AuthorizedSession(creds)
     colab = Client(Prod(), sess)
-    hook = None
-    if drive_hook_enabled:
-        hook = make_drive_hook(creds, req.endpoint)
+
+    # Instantiate runtime without drive_hook (the library doesn't accept it)
     runtime = ColabRuntime(
         req.url,
         req.token,
         kernel_id=req.kernel_id,
         session_id=req.session_id,
-        drive_hook=hook,
     )
+
+    # Set the hook after construction
+    if drive_hook_enabled:
+        runtime.colab_request_hook = make_drive_hook(creds, req.endpoint)
+
     return colab, runtime
 
 # ---- Endpoints ----
@@ -315,10 +322,11 @@ def keep_alive(endpoint: str, req: SessionContext):
 @app.post("/sessions/{endpoint}/execute")
 def execute(endpoint: str, req: ExecuteRequest):
     logger.info("Execute request for %s", endpoint)
+
     try:
         _, runtime = get_session_and_runtime(req)
     except Exception as e:
-        logger.exception("Failed to build session and runtime")
+        logger.exception("Failed to build runtime")
         raise HTTPException(500, str(e))
 
     outputs = []
@@ -333,10 +341,9 @@ def execute(endpoint: str, req: ExecuteRequest):
     finally:
         runtime.stop()
 
-    logger.info("Execution done, %d outputs", len(outputs))
+    logger.info("Execution completed with %d outputs", len(outputs))
     return {"outputs": outputs}
 
-# ---- File endpoints (unchanged) ----
 @app.post("/sessions/{endpoint}/files/list")
 def list_files_endpoint(endpoint: str, req: SessionContext, path: str = "content"):
     class Dummy:
@@ -426,7 +433,7 @@ def delete_file(endpoint: str, path: str, token: str, url: str):
         raise HTTPException(500, str(e))
     return {"message": "Deleted"}
 
-# ---- Automation endpoints (unchanged) ----
+# ---- Automation endpoints ----
 @app.post("/sessions/{endpoint}/automation/auth")
 def run_auth(endpoint: str, req: AutomationRequest):
     code = (
