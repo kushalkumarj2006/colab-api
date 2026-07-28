@@ -166,19 +166,19 @@ class ColabRuntime:
 
         kwargs = {
             "server_url": self.url,
-            "proxy_token": self.token,  # <--- FIX: Added proxy_token argument
+            "proxy_token": self.token,
+            "kernel_id": self.kernel_id,  # <--- FIX: Always pass kernel_id (even if None)
             "session": self.session_id,
             "headers": {
                 "X-Colab-Client-Agent": "colab-api",
                 "X-Colab-Runtime-Proxy-Token": self.token,
             },
         }
-        if self.kernel_id:
-            kwargs["kernel_id"] = self.kernel_id
 
         client = jupyter_kernel_client.ColabKernelClient(**kwargs)
         client.start()
 
+        # Capture the newly created kernel_id if we didn't have one
         if not self.kernel_id:
             self.kernel_id = getattr(client, "kernel_id", None)
 
