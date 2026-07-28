@@ -478,6 +478,10 @@ def list_files(endpoint: str, credentials: CredentialsModel, token: str, url: st
         raise HTTPException(500, str(e))
     return {"files": files}
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/sessions/{endpoint}/files")
 def upload_file(
     endpoint: str,
