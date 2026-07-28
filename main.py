@@ -43,12 +43,12 @@ PUBLIC_SCOPES = [
 REMOTE_REDIRECT_URI = "https://sdk.cloud.google.com/applicationdefaultauthcode.html"
 CLIENT_CONFIG = {
     "installed": {
-        "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com",
-        "project_id": "cloud-sdk-platform",
+        "client_id": os.environ.get("OAUTH_CLIENT_ID"),
+        "project_id": os.environ.get("OAUTH_PROJECT_ID,
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
         "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty",
+        "client_secret": os.environ.get("OAUTH_CLIENT_SECRET"),
         "redirect_uris": [REMOTE_REDIRECT_URI],
     }
 }
